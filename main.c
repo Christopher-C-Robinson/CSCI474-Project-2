@@ -2,23 +2,21 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <string.h>
-#include <stdbool.h>
+#include <semaphore.h>
 
-#define NUM_GUESTS 10
-#define NUM_ROOMS 5
+#define NUM_GUESTS 5
+#define NUM_ROOMS 3
 #define NUM_ACTIVITIES 4
 
-// Mutex and condition variables
-pthread_mutex_t room_assign_mutex, count_mutex;
-pthread_cond_t check_in_cond, check_out_cond;
+// Semaphores
+sem_t room_sem, check_in_sem, check_out_sem, activity_sem;
 
 // Shared resources and counters
-int rooms[NUM_ROOMS];
+int rooms[NUM_ROOMS] = {0};
 int activity_counters[NUM_ACTIVITIES] = {0};
 const char* activity_names[] = {"Swimming Pool", "Restaurant", "Fitness Center", "Business Center"};
 
-int guests_checked_out = 0; // Counter for guests who have checked out
+int guests_checked_out = 0;
 
 // Function to choose a random activity for a guest
 int choose_activity() {
@@ -28,73 +26,98 @@ int choose_activity() {
 // Guest thread function
 void* guest(void* id) {
     int guest_id = *((int*)id);
-    int assigned_room = -1;
+    int room_assigned = -1;
 
-    // Check in
-    pthread_mutex_lock(&room_assign_mutex);
-    while (assigned_room == -1) {
+    // Try to get a room
+    while (room_assigned == -1) {
+        sem_wait(&room_sem);
         for (int i = 0; i < NUM_ROOMS; i++) {
-            if (rooms[i] == 0) { // If room is available
-                rooms[i] = 1; // Assign the room
-                assigned_room = i;
-                printf("Guest %d enters the hotel and is assigned room %d.\n", guest_id, assigned_room);
+            if (rooms[i] == 0) {
+                rooms[i] = 1;
+                room_assigned = i;
+                printf("Guest %d enters the hotel and is assigned room %d.\n", guest_id, room_assigned);
                 break;
             }
         }
-        if (assigned_room == -1) {
-            pthread_cond_wait(&check_in_cond, &room_assign_mutex); // Wait for room assignment
+        if (room_assigned == -1) {
+            // If no room is available, release semaphore and try again
+            sem_post(&room_sem);
         }
     }
-    pthread_mutex_unlock(&room_assign_mutex);
+
+    // Check-in process
+    sem_wait(&check_in_sem);
+    printf("Guest %d goes to the check-in reservationist.\n", guest_id);
+    printf("The check-in reservationist greets Guest %d and assigns room %d.\n", guest_id, room_assigned);
+    sem_post(&check_in_sem);
 
     // Engage in an activity
     int activity = choose_activity();
+    sem_wait(&activity_sem);
     printf("Guest %d goes to the %s.\n", guest_id, activity_names[activity]);
     sleep(rand() % 3 + 1); // Simulate activity time
-    pthread_mutex_lock(&count_mutex);
     activity_counters[activity]++;
-    pthread_mutex_unlock(&count_mutex);
+    sem_post(&activity_sem);
 
-    // Check out
-    pthread_mutex_lock(&room_assign_mutex);
-    printf("Guest %d checks out and leaves room %d.\n", guest_id, assigned_room);
-    rooms[assigned_room] = 0; // Free the room
+    // Check-out process
+    sem_wait(&check_out_sem);
+    printf("Guest %d goes to the check-out reservationist and returns room %d.\n", guest_id, room_assigned);
+    printf("The check-out reservationist greets Guest %d and receives the key for room %d.\n", guest_id, room_assigned);
+    printf("Guest %d receives the receipt.\n", guest_id);
+    rooms[room_assigned] = 0;
     guests_checked_out++;
-    pthread_cond_signal(&check_out_cond); // Signal the check-out reservationist
-    pthread_mutex_unlock(&room_assign_mutex);
+    sem_post(&room_sem);
+    sem_post(&check_out_sem);
 
     return NULL;
 }
 
 // Check-in reservationist thread function
 void* check_in_reservationist(void* arg) {
-    pthread_mutex_lock(&room_assign_mutex);
-    while (guests_checked_out < NUM_GUESTS) {
-        pthread_cond_signal(&check_in_cond); // Signal a waiting guest for room assignment
-        pthread_cond_wait(&check_out_cond, &room_assign_mutex); // Wait for a guest to check out
+    while (1) {
+        sem_wait(&check_in_sem);
+        // Check-in reservationist is waiting for guests
+        if (guests_checked_out >= NUM_GUESTS) {
+            sem_post(&check_in_sem);
+            break;
+        }
+        sem_post(&check_in_sem);
     }
-    pthread_mutex_unlock(&room_assign_mutex);
+    return NULL;
+}
+
+// Check-out reservationist thread function
+void* check_out_reservationist(void* arg) {
+    while (1) {
+        sem_wait(&check_out_sem);
+        // Check-out reservationist is waiting for guests
+        if (guests_checked_out >= NUM_GUESTS) {
+            sem_post(&check_out_sem);
+            break;
+        }
+        sem_post(&check_out_sem);
+    }
     return NULL;
 }
 
 // Main function
 int main() {
-    pthread_t guests[NUM_GUESTS], check_in_thread;
+    pthread_t guests[NUM_GUESTS], check_in_thread, check_out_thread;
     int guest_ids[NUM_GUESTS];
     int i;
 
-    // Initialize mutexes and condition variables
-    pthread_mutex_init(&room_assign_mutex, NULL);
-    pthread_mutex_init(&count_mutex, NULL);
-    pthread_cond_init(&check_in_cond, NULL);
-    pthread_cond_init(&check_out_cond, NULL);
+    // Initialize semaphores
+    sem_init(&room_sem, 0, NUM_ROOMS);
+    sem_init(&check_in_sem, 0, 1);
+    sem_init(&check_out_sem, 0, 1);
+    sem_init(&activity_sem, 0, 1);
 
-    // Initialize room availability and seed random number generator
-    memset(rooms, 0, sizeof(rooms));
+    // Seed random number generator
     srand(time(NULL));
 
-    // Create check-in reservationist thread
+    // Create check-in and check-out reservationist threads
     pthread_create(&check_in_thread, NULL, check_in_reservationist, NULL);
+    pthread_create(&check_out_thread, NULL, check_out_reservationist, NULL);
 
     // Create guest threads
     for (i = 0; i < NUM_GUESTS; i++) {
@@ -107,8 +130,9 @@ int main() {
         pthread_join(guests[i], NULL);
     }
 
-    // Join the check-in reservationist thread
+    // Join check-in and check-out reservationist threads
     pthread_join(check_in_thread, NULL);
+    pthread_join(check_out_thread, NULL);
 
     // Print activity counters
     printf("\n--------------------\n\n");
@@ -118,10 +142,10 @@ int main() {
     }
 
     // Clean up
-    pthread_mutex_destroy(&room_assign_mutex);
-    pthread_mutex_destroy(&count_mutex);
-    pthread_cond_destroy(&check_in_cond);
-    pthread_cond_destroy(&check_out_cond);
+    sem_destroy(&room_sem);
+    sem_destroy(&check_in_sem);
+    sem_destroy(&check_out_sem);
+    sem_destroy(&activity_sem);
 
     return 0;
 }
