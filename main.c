@@ -4,47 +4,62 @@
 #include <semaphore.h>
 #include <unistd.h>
 
-#define NUM_GUESTS 5
-#define NUM_ROOMS 3
+#define NUM_GUESTS 10
+#define NUM_ROOMS 5
+#define NUM_RESERVATIONISTS 2
 
 // Semaphores
 sem_t room_sem[NUM_ROOMS];
-sem_t check_in_sem;
-sem_t check_out_sem;
-sem_t ready_for_check_in_sem[NUM_GUESTS];
+sem_t check_in_queue_sem, check_out_queue_sem;
+sem_t check_in_process_sem[NUM_RESERVATIONISTS];
+sem_t check_out_process_sem[NUM_RESERVATIONISTS];
 sem_t checked_in_sem[NUM_GUESTS];
-sem_t ready_for_check_out_sem[NUM_GUESTS];
+sem_t checked_out_sem[NUM_GUESTS];
+sem_t room_available_sem;
 
 // Shared resources
 int rooms[NUM_ROOMS] = {0}; // Room availability
 int activity_counter[4] = {0}; // Counter for each activity
+int check_in_queue[NUM_GUESTS], check_out_queue[NUM_GUESTS];
+int check_in_queue_size = 0, check_out_queue_size = 0;
 
 // Thread functions
 void* guest(void* arg);
 void* check_in_reservationist(void* arg);
 void* check_out_reservationist(void* arg);
+void enqueue(int queue[], int *queue_size, int value);
+int dequeue(int queue[], int *queue_size);
 
 int main() {
     pthread_t guests[NUM_GUESTS];
-    pthread_t check_in_thread, check_out_thread;
+    pthread_t check_in_threads[NUM_RESERVATIONISTS], check_out_threads[NUM_RESERVATIONISTS];
     int i;
 
     // Initialize semaphores
     for (i = 0; i < NUM_ROOMS; i++) {
-        sem_init(&room_sem[i], 0, 1); // Initialize each room semaphore
+        sem_init(&room_sem[i], 0, 1); // Room semaphores
     }
-    sem_init(&check_in_sem, 0, 1);
-    sem_init(&check_out_sem, 0, 1);
+    sem_init(&check_in_queue_sem, 0, 1); // Queue semaphores
+    sem_init(&check_out_queue_sem, 0, 1);
+    sem_init(&room_available_sem, 0, 0); // Room availability semaphore
+    for (i = 0; i < NUM_RESERVATIONISTS; i++) {
+        sem_init(&check_in_process_sem[i], 0, 1); // Process semaphores
+        sem_init(&check_out_process_sem[i], 0, 1);
+    }
     for (i = 0; i < NUM_GUESTS; i++) {
-        sem_init(&ready_for_check_in_sem[i], 0, 0); // Initialize check-in semaphores for each guest
-        sem_init(&checked_in_sem[i], 0, 0); // Initialize checked-in semaphores for each guest
-        sem_init(&ready_for_check_out_sem[i], 0, 0); // Initialize check-out semaphores for each guest
+        sem_init(&checked_in_sem[i], 0, 0); // Guest check-in/out semaphores
+        sem_init(&checked_out_sem[i], 0, 0);
     }
 
-    // Create threads
-    pthread_create(&check_in_thread, NULL, check_in_reservationist, NULL);
-    pthread_create(&check_out_thread, NULL, check_out_reservationist, NULL);
+    // Create reservationist threads
+    for (i = 0; i < NUM_RESERVATIONISTS; i++) {
+        int *id = malloc(sizeof(int));
+        *id = i;
+        pthread_create(&check_in_threads[i], NULL, check_in_reservationist, id);
+        pthread_create(&check_out_threads[i], NULL, check_out_reservationist, id);
+    }
 
+    // Create guest threads
     for (i = 0; i < NUM_GUESTS; i++) {
         int *id = malloc(sizeof(int));
         *id = i;
@@ -67,15 +82,33 @@ int main() {
     for (i = 0; i < NUM_ROOMS; i++) {
         sem_destroy(&room_sem[i]);
     }
-    sem_destroy(&check_in_sem);
-    sem_destroy(&check_out_sem);
+    sem_destroy(&check_in_queue_sem);
+    sem_destroy(&check_out_queue_sem);
+    sem_destroy(&room_available_sem);
+    for (i = 0; i < NUM_RESERVATIONISTS; i++) {
+        sem_destroy(&check_in_process_sem[i]);
+        sem_destroy(&check_out_process_sem[i]);
+    }
     for (i = 0; i < NUM_GUESTS; i++) {
-        sem_destroy(&ready_for_check_in_sem[i]);
         sem_destroy(&checked_in_sem[i]);
-        sem_destroy(&ready_for_check_out_sem[i]);
+        sem_destroy(&checked_out_sem[i]);
     }
 
     return 0;
+}
+
+void enqueue(int queue[], int *queue_size, int value) {
+    queue[*queue_size] = value;
+    (*queue_size)++;
+}
+
+int dequeue(int queue[], int *queue_size) {
+    int value = queue[0];
+    for (int i = 0; i < *queue_size - 1; i++) {
+        queue[i] = queue[i + 1];
+    }
+    (*queue_size)--;
+    return value;
 }
 
 void* guest(void* arg) {
@@ -83,10 +116,15 @@ void* guest(void* arg) {
     char* activities[] = {"swimming pool", "restaurant", "fitness center", "business center"};
     int activity_index;
 
-    printf("Guest %d enters the hotel\n", id); // Guest enters the hotel
-    // Indicate readiness for check-in
-    printf("Guest %d goes to the check-in reservationist\n", id); // Guest goes to the check-in reservationist
-    sem_post(&ready_for_check_in_sem[id]);
+    printf("Guest %d enters the hotel\n", id);
+    sem_wait(&check_in_queue_sem);
+    enqueue(check_in_queue, &check_in_queue_size, id);
+    sem_post(&check_in_queue_sem);
+
+    // Notify one of the check-in reservationists
+    for (int i = 0; i < NUM_RESERVATIONISTS; i++) {
+        sem_post(&check_in_process_sem[i]);
+    }
 
     // Wait for room assignment
     sem_wait(&checked_in_sem[id]);
@@ -97,51 +135,94 @@ void* guest(void* arg) {
     activity_counter[activity_index]++;
     sleep(rand() % 3 + 1);
 
-    // Indicate readiness for check-out
-    printf("Guest %d goes to the check-out reservationist\n", id); // Guest goes to the check-out reservationist
-    sem_post(&ready_for_check_out_sem[id]);
+    sem_wait(&check_out_queue_sem);
+    enqueue(check_out_queue, &check_out_queue_size, id);
+    sem_post(&check_out_queue_sem);
+
+    // Notify one of the check-out reservationists
+    for (int i = 0; i < NUM_RESERVATIONISTS; i++) {
+        sem_post(&check_out_process_sem[i]);
+    }
 
     // Wait for check-out completion
-    sem_wait(&checked_in_sem[id]); // Reuse this semaphore for check-out completion
+    sem_wait(&checked_out_sem[id]);
 
     free(arg);
     return NULL;
 }
 
 void* check_in_reservationist(void* arg) {
-    int currentRoom = 0;
+    int res_id = *(int*)arg;
     while (1) {
-        for (int i = 0; i < NUM_GUESTS; i++) {
-            sem_wait(&ready_for_check_in_sem[i]); // Wait for a guest to be ready
-            sem_wait(&room_sem[currentRoom]); // Acquire a room
-            sem_wait(&check_in_sem);
-            printf("The check-in reservationist greets Guest %d and assigns Room %d\n", i, currentRoom);
-            rooms[currentRoom] = 1; // Mark room as occupied
-            sem_post(&checked_in_sem[i]); // Indicate that the guest is checked in
-            sem_post(&check_in_sem);
-            currentRoom = (currentRoom + 1) % NUM_ROOMS;
+        sem_wait(&check_in_process_sem[res_id]); // Wait for a guest to be ready to check in
+
+        sem_wait(&check_in_queue_sem);
+        if (check_in_queue_size > 0) {
+            int guest_id = dequeue(check_in_queue, &check_in_queue_size);
+            sem_post(&check_in_queue_sem);
+
+            int room_assigned = -1;
+            while (room_assigned == -1) {
+                for (int i = 0; i < NUM_ROOMS; i++) {
+                    sem_wait(&room_sem[i]); // Try to acquire the room semaphore
+                    if (!rooms[i]) { // Check if room is unoccupied
+                        rooms[i] = 1; // Mark room as occupied
+                        room_assigned = i;
+                        sem_post(&room_sem[i]);
+                        break;
+                    } else {
+                        sem_post(&room_sem[i]); // Release semaphore if room is occupied
+                    }
+                }
+
+                if (room_assigned == -1) {
+                    // No room available, wait for a room to become available
+                    sem_wait(&room_available_sem);
+                }
+            }
+
+            printf("Check-in reservationist %d greets Guest %d and assigns Room %d\n", res_id, guest_id, room_assigned);
+            sem_post(&checked_in_sem[guest_id]); // Signal the guest that check-in is complete
+        } else {
+            sem_post(&check_in_queue_sem);
         }
     }
+    free(arg);
     return NULL;
 }
 
 void* check_out_reservationist(void* arg) {
+    int res_id = *(int*)arg;
     while (1) {
-        for (int i = 0; i < NUM_GUESTS; i++) {
-            sem_wait(&ready_for_check_out_sem[i]); // Wait for a guest to be ready for check-out
-            sem_wait(&check_out_sem);
-            printf("The check-out reservationist greets Guest %d and receives the key\n", i);
-            printf("The receipt was printed.\n"); // Print the receipt
-            for (int j = 0; j < NUM_ROOMS; j++) {
-                if (rooms[j] == 1) { // Find the occupied room
-                    rooms[j] = 0; // Mark room as available
-                    sem_post(&room_sem[j]); // Release room semaphore
+        sem_wait(&check_out_process_sem[res_id]);
+        sem_wait(&check_out_queue_sem);
+        if (check_out_queue_size > 0) {
+            int guest_id = dequeue(check_out_queue, &check_out_queue_size);
+            sem_post(&check_out_queue_sem);
+
+            int room_vacated = -1;
+            for (int i = 0; i < NUM_ROOMS; i++) {
+                sem_wait(&room_sem[i]);
+                if (rooms[i]) {
+                    rooms[i] = 0; // Vacate the room
+                    room_vacated = i;
+                    sem_post(&room_sem[i]);
                     break;
                 }
+                sem_post(&room_sem[i]);
             }
-            sem_post(&checked_in_sem[i]); // Use this semaphore to indicate check-out completion
-            sem_post(&check_out_sem);
+
+            printf("Check-out reservationist %d greets Guest %d\n", res_id, guest_id);
+            printf("Check-out reservationist %d printed the receipt for Guest %d\n", res_id, guest_id);
+            sem_post(&checked_out_sem[guest_id]);
+
+            if (room_vacated != -1) {
+                sem_post(&room_available_sem); // Signal that a room is now available
+            }
+        } else {
+            sem_post(&check_out_queue_sem);
         }
     }
+    free(arg);
     return NULL;
 }
